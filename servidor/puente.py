@@ -11,6 +11,7 @@ Protocolo
                                                            ← {"t": "version", "anfitrion": "1.5"}  (distinta versión)
                                                            ← {"t": "error", "texto": "..."}
     anfitrión → {"t": "echar", "id": N}
+    cualquiera → {"t": "informe", "titulo": "...", "texto": "..."}  ← {"t": "informe_ok", "donde": "..."}
     a todos   ← {"t": "entra", "id": N} · {"t": "sale", "id": N} · {"t": "cerrada"}
   Binario (datos del juego):
     cliente → [destino int32 LE][canal u8][modo u8][carga]    destino 0 = todos, <0 = todos menos -destino
@@ -25,11 +26,17 @@ import os
 import random
 import struct
 import time
+import urllib.request
 
 from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed
 
 ALFABETO = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+# Buzón de informes: avisos (issues) en un repositorio privado de GitHub. El token vive solo
+# aquí, en el servidor (variable de entorno), nunca dentro del juego.
+TOKEN_INFORMES = os.environ.get("GITHUB_TOKEN", "")
+REPO_INFORMES = os.environ.get("REPO_INFORMES", "whayito/zona-muerta-informes")
+ultimos_informes: list[float] = []
 MAX_JUGADORES = 4
 salas: dict[str, "Sala"] = {}
 
@@ -117,6 +124,9 @@ async def atender(ws) -> None:
                 for i, c in list(s.miembros.items()):
                     if i != mi_id:
                         await enviar_json(c, {"t": "entra", "id": mi_id})
+            elif tipo == "informe":
+                donde = await guardar_informe(str(datos.get("titulo", "Informe"))[:200], str(datos.get("texto", ""))[:60000])
+                await enviar_json(ws, {"t": "informe_ok", "donde": donde})
             elif tipo == "echar" and sala is not None and mi_id == 1:
                 otro = sala.miembros.get(int(datos.get("id", 0)))
                 if otro is not None:
@@ -141,6 +151,33 @@ async def salir(sala: Sala, mi_id: int) -> None:
     else:
         for c in list(sala.miembros.values()):
             await enviar_json(c, {"t": "sale", "id": mi_id})
+
+
+async def guardar_informe(titulo: str, texto: str) -> str:
+    """Crea un aviso en el buzón privado. Sin token, al menos queda en el registro del servidor."""
+    ahora = time.time()
+    ultimos_informes[:] = [t for t in ultimos_informes if ahora - t < 3600]
+    if len(ultimos_informes) >= 30:
+        return "limite"
+    ultimos_informes.append(ahora)
+    print(f"=== INFORME: {titulo}\n{texto}\n=== FIN INFORME", flush=True)
+    if not TOKEN_INFORMES:
+        return "registro"
+
+    def crear() -> str:
+        cuerpo = json.dumps({"title": titulo, "body": "```\n" + texto + "\n```", "labels": ["informe"]}).encode()
+        pet = urllib.request.Request(
+            f"https://api.github.com/repos/{REPO_INFORMES}/issues", data=cuerpo, method="POST",
+            headers={"Authorization": f"Bearer {TOKEN_INFORMES}", "Accept": "application/vnd.github+json",
+                     "User-Agent": "zona-muerta-puente"})
+        with urllib.request.urlopen(pet, timeout=15) as r:
+            return str(json.loads(r.read()).get("number", "?"))
+
+    try:
+        return "github #" + await asyncio.to_thread(crear)
+    except Exception as e:  # sin romper el puente por un informe
+        print("No se pudo crear el aviso en GitHub:", e, flush=True)
+        return "registro"
 
 
 def salud(conexion, peticion):
