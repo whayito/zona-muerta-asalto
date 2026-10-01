@@ -22,6 +22,10 @@ Protocolo
     cliente → {"t": "invitar", "a": "NOMBRE#1234", "sala": "KXQM"}
                                                            ← {"t": "invitado", "a", "ok": bool, "texto"}
     destinatario ← {"t": "invitacion", "de": "NOMBRE#1234", "nombre", "sala"}
+  Avisos con el juego cerrado (desde la 0.2.5, Android, Firebase Cloud Messaging):
+    cliente → {"t": "token", "token": "..."}  (o "token" dentro del «hola»; "" = sin avisos)
+    Al invitar a alguien que no está conectado pero tiene token, se le manda una notificación
+    al móvil (← {"t": "invitado", "ok": true, "movil": true}). Tokens guardados en Firestore.
   Solo en memoria: quién está conectado ahora y con qué código. Límite de mensajes por conexión.
   Binario (datos del juego):
     cliente → [destino int32 LE][canal u8][modo u8][carga]    destino 0 = todos, <0 = todos menos -destino
@@ -39,6 +43,7 @@ import struct
 import time
 import urllib.request
 
+from avisos import Avisos
 from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed
 
@@ -58,6 +63,7 @@ MAX_INVITACIONES_MIN = 10          # por conexión
 MAX_MENSAJES_10S = 40              # mensajes de control por conexión cada 10 s
 MAX_CONSULTA = 100                 # códigos por consulta de amigos
 presentes: dict[str, "Presente"] = {}
+avisos = Avisos()
 
 
 class Presente:
@@ -113,7 +119,7 @@ def estado_valido(texto) -> str:
     return "menu"
 
 
-async def amigos(ws, datos: dict, yo: "Presente | None", avisos: dict) -> "Presente | None":
+async def amigos(ws, datos: dict, yo: "Presente | None", limites: dict) -> "Presente | None":
     """Mensajes de presencia y amigos. Devuelve el Presente de esta conexión (o None)."""
     tipo = datos.get("t")
     ahora = time.time()
@@ -133,11 +139,15 @@ async def amigos(ws, datos: dict, yo: "Presente | None", avisos: dict) -> "Prese
         yo = Presente(ws, uid, codigo, str(datos.get("nombre", ""))[:16], str(datos.get("version", ""))[:16])
         presentes[codigo.lower()] = yo
         await enviar_json(ws, {"t": "hola_ok"})
+        if "token" in datos:
+            await guardar_token(yo, datos.get("token"))
         return yo
     if yo is None:
         return yo
     if tipo == "estado":
         yo.estado = estado_valido(datos.get("estado"))
+    elif tipo == "token":
+        await guardar_token(yo, datos.get("token"))
     elif tipo == "amigos?":
         codigos = datos.get("codigos", [])
         if not isinstance(codigos, list):
@@ -155,25 +165,65 @@ async def amigos(ws, datos: dict, yo: "Presente | None", avisos: dict) -> "Prese
     elif tipo == "invitar":
         destino = normalizar_codigo(datos.get("a"))
         sala = str(datos.get("sala", "")).strip().upper()
-        avisos["invitaciones"] = [t for t in avisos.get("invitaciones", []) if ahora - t < 60]
-        if len(avisos["invitaciones"]) >= MAX_INVITACIONES_MIN:
+        limites["invitaciones"] = [t for t in limites.get("invitaciones", []) if ahora - t < 60]
+        if len(limites["invitaciones"]) >= MAX_INVITACIONES_MIN:
             await enviar_json(ws, {"t": "invitado", "a": destino, "ok": False, "texto": "Demasiadas invitaciones: espera un minuto."})
             return yo
         p = presentes.get(destino.lower()) if destino else None
-        if p is None or not CODIGO_SALA.match(sala) or sala not in salas:
-            await enviar_json(ws, {"t": "invitado", "a": destino, "ok": False, "texto": "No está conectado o la sala no existe."})
+        if not CODIGO_SALA.match(sala) or sala not in salas:
+            await enviar_json(ws, {"t": "invitado", "a": destino, "ok": False, "texto": "La sala no existe."})
             return yo
-        avisos["invitaciones"].append(ahora)
+        if p is None:
+            # No está conectado: si tiene el aviso activado, le llega al móvil.
+            r = "sin_token"
+            if destino and avisos.activo:
+                avisos_inv = avisos_por_destino.setdefault(destino.lower(), [])
+                avisos_inv[:] = [t for t in avisos_inv if ahora - t < 600]
+                if len(avisos_inv) >= 5:
+                    r = "demasiados"
+                else:
+                    try:
+                        r = await asyncio.to_thread(avisos.enviar_invitacion, destino, yo.codigo, yo.nombre, sala)
+                    except Exception as e:
+                        print("Avisos: fallo al enviar:", type(e).__name__, flush=True)
+                        r = "error"
+                    if r == "enviado":
+                        avisos_inv.append(ahora)
+            limites["invitaciones"].append(ahora)
+            if r == "enviado":
+                await enviar_json(ws, {"t": "invitado", "a": destino, "ok": True, "movil": True, "texto": "Aviso enviado a su móvil."})
+            else:
+                texto = {"sin_token": "No está conectado y no tiene los avisos activados.",
+                         "demasiados": "Ya le has mandado varios avisos: espera un poco."}.get(r, "No se pudo enviar el aviso a su móvil.")
+                await enviar_json(ws, {"t": "invitado", "a": destino, "ok": False, "texto": texto, "detalle": r})
+            return yo
+        limites["invitaciones"].append(ahora)
         await enviar_json(p.ws, {"t": "invitacion", "de": yo.codigo, "nombre": yo.nombre, "sala": sala})
         await enviar_json(ws, {"t": "invitado", "a": destino, "ok": True, "texto": ""})
     return yo
+
+
+# Avisos al móvil por destinatario (además del límite por conexión): máximo 5 cada 10 min.
+avisos_por_destino: dict[str, list[float]] = {}
+
+
+async def guardar_token(yo: "Presente", token) -> None:
+    token = str(token or "").strip()[:4096]
+    if not avisos.activo:
+        return
+    try:
+        r = await asyncio.to_thread(avisos.guardar, yo.codigo, yo.uid, token)
+    except Exception as e:
+        print("Avisos: fallo al guardar el token:", type(e).__name__, flush=True)
+        r = "error"
+    await enviar_json(yo.ws, {"t": "token_ok", "ok": r == "ok", "detalle": r})
 
 
 async def atender(ws) -> None:
     sala: Sala | None = None
     mi_id = 0
     yo: Presente | None = None
-    avisos: dict = {}
+    limites: dict = {}
     control: list[float] = []
     try:
         async for mensaje in ws:
@@ -208,8 +258,8 @@ async def atender(ws) -> None:
                 continue
             control.append(ahora)
             tipo = datos.get("t")
-            if tipo in ("hola", "estado", "amigos?", "existe?", "invitar"):
-                yo = await amigos(ws, datos, yo, avisos)
+            if tipo in ("hola", "estado", "token", "amigos?", "existe?", "invitar"):
+                yo = await amigos(ws, datos, yo, limites)
             elif tipo == "crear" and sala is None:
                 codigo = nuevo_codigo()
                 sala = Sala(codigo, ws, str(datos.get("version", "")))
